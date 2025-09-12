@@ -29,7 +29,8 @@
     "@types/node": "^20.11.30",
     "@types/cors": "^2.8.17",
     "@types/multer": "^1.4.11",
+    "@types/better-sqlite3": "^7.6.8",
+"@types/mime-types": "^2.1.4"
     "ts-node": "^10.9.2",
     "typescript": "^5.4.5"
   }
-}
