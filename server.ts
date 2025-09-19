@@ -1,93 +1,225 @@
-import "dotenv/config";
-import express from "express";
-import cors from "cors";
-import bodyParser from "body-parser";
-import multer from "multer";
-import { createTx, findByToken, updateTx, findById } from "./db.js";
-import { saveEncryptedFile } from "./storage.js";
-import { sendEmail } from "./mailer.js";
-import { sendSMS, sendWhatsApp } from "./messenger.js";
-import { runScreening } from "./screening.js";
-import { CreateTxPayload } from "./types.js";
+// server.ts
+import 'dotenv/config';
+import express, { Request, Response, NextFunction } from 'express';
+import cors from 'cors';
+import multer from 'multer';
+import fetch from 'node-fetch';
+import sgMail from '@sendgrid/mail';
 
+// -----------------------------
+// Config & helpers
+// -----------------------------
 const app = express();
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 15 * 1024 * 1024 } });
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 8 * 1024 * 1024 } }); // 8MB
 
-// CORS
-const allowed = (process.env.CORS_ALLOWED_ORIGINS || "*").split(",").map(s => s.trim());
-app.use(cors({ origin: (origin, cb) => {
-  if (!origin || allowed.includes("*") || allowed.includes(origin)) return cb(null, true);
-  return cb(new Error("CORS blocked"));
-}, credentials: true }));
+// CORS: lee de env (coma separada) o usa una lista por defecto
+const allowed = (process.env.CORS_ALLOWED_ORIGINS ?? '')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
 
-app.use(bodyParser.json({ limit: "10mb" }));
-app.get("/health", (_, res) => res.json({ ok: true }));
+if (allowed.length === 0) {
+  allowed.push(
+    'https://agmanagement.co',
+    'https://*.hostingersite.com',
+    'http://localhost:3000',
+    'http://localhost:5173'
+  );
+}
 
-// Create transaction
-app.post("/api/tx/create", async (req, res) => {
+app.use(
+  cors({
+    origin: (origin, cb) => {
+      if (!origin) return cb(null, true);
+      const ok = allowed.some((p) =>
+        p.includes('*')
+          ? new RegExp('^' + p.replace(/\./g, '\\.').replace(/\*/g, '.*') + '$').test(origin)
+          : origin === p
+      );
+      cb(ok ? null : new Error('Not allowed by CORS'), ok);
+    },
+    methods: ['GET', 'POST', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+    credentials: true,
+  })
+);
+app.options('*', cors());
+
+app.use(express.json({ limit: '2mb' }));
+
+// SendGrid (opcional)
+if (process.env.SENDGRID_API_KEY) {
+  sgMail.setApiKey(process.env.SENDGRID_API_KEY);
+}
+
+// -----------------------------
+// Utilidades de precio
+// -----------------------------
+type PriceResp = { usd: number };
+
+const COINGECKO_IDS: Record<string, string> = {
+  BTC: 'bitcoin',
+  ETH: 'ethereum',
+  USDT: 'tether',
+  USDC: 'usd-coin',
+  SOL: 'solana',
+  ADA: 'cardano',
+  XRP: 'ripple',
+  BNB: 'binancecoin',
+  DOGE: 'dogecoin',
+  TRX: 'tron',
+  AVAX: 'avalanche-2',
+  DOT: 'polkadot',
+  MATIC: 'matic-network',
+  TON: 'the-open-network',
+  SHIB: 'shiba-inu',
+  // agrega más si quieres
+};
+
+async function fetchUsdPrice(asset: string): Promise<number> {
+  const symbol = asset.toUpperCase();
+  const id = COINGECKO_IDS[symbol] ?? COINGECKO_IDS['BTC'];
+  const url = `https://api.coingecko.com/api/v3/simple/price?ids=${encodeURIComponent(
+    id
+  )}&vs_currencies=usd`;
+  const r = await fetch(url);
+  if (!r.ok) throw new Error('Price provider error');
+  const j = (await r.json()) as Record<string, PriceResp>;
+  const price = j[id]?.usd;
+  if (!price || typeof price !== 'number') throw new Error('Invalid price');
+  return price;
+}
+
+// -----------------------------
+// Rutas
+// -----------------------------
+
+// Health
+app.get('/health', (_req, res) => {
+  res.json({ ok: true, service: 'kyc-backend', ts: Date.now() });
+});
+
+// Subida + OCR simulado
+// Front debe enviar campo "idImage" (input type="file" name="idImage")
+app.post('/api/ocr', upload.single('idImage'), async (req: Request, res: Response) => {
   try {
-    const p = req.body as CreateTxPayload;
-    if (!p.fullName || !p.asset || !p.usdAmount || !p.pricing?.priceUsd) return res.status(400).json({ error: "missing fields" });
-    const sanctions = await runScreening(p.fullName, p.dob);
-    const rec = createTx({ ...p });
-    const rec2 = updateTx(rec.id, { sanctions })!;
-    return res.json({ id: rec2.id, token: rec2.token, status: rec2.status });
-  } catch (e: any) { return res.status(500).json({ error: e.message }); }
+    if (!req.file) {
+      return res.status(400).json({ ok: false, error: 'Missing file idImage' });
+    }
+
+    // Aquí integrarías tu OCR/IDV real. Por ahora, simulamos:
+    const demo = {
+      fullName: 'John Michael Doe',
+      documentType: 'Driver License',
+      documentNumber: 'D12345678',
+      dob: '1990-05-10',
+      address: '123 Main St, Las Vegas, NV 89101, USA',
+      country: 'US',
+    };
+
+    // Si quieres guardar el binario en GDrive/S3, hazlo aquí usando req.file.buffer
+
+    res.json({ ok: true, data: demo });
+  } catch (err: any) {
+    console.error('OCR error', err);
+    res.status(500).json({ ok: false, error: err?.message || 'Internal error' });
+  }
 });
 
-// Upload encrypted evidence
-app.post("/api/tx/:id/upload", upload.single("file"), async (req, res) => {
+// Cotización: { asset, amountUsd }
+app.post('/api/quote', async (req: Request, res: Response) => {
   try {
-    const id = req.params.id; const kind = (req.query.kind as string) || "bin";
-    const rec = findById(id);
-    if (!rec) return res.status(404).json({ error: "not found" });
-    if (!req.file) return res.status(400).json({ error: "file required" });
-    const ext = kind === "pdf" ? "pdf" : "jpg";
-    const stored = await saveEncryptedFile(kind, req.file.buffer, ext);
-    const files = { ...rec.files, [kind]: stored } as any;
-    const next = updateTx(id, { files });
-    return res.json({ ok: true, path: stored, id: next?.id });
-  } catch (e: any) { return res.status(500).json({ error: e.message }); }
+    const { asset, amountUsd } = req.body || {};
+    if (!asset || typeof amountUsd !== 'number' || amountUsd <= 0) {
+      return res.status(400).json({ ok: false, error: 'asset and amountUsd required' });
+    }
+
+    const priceUsd = await fetchUsdPrice(asset);
+    const feePct = 0.05; // 5%
+    const feeUsd = +(amountUsd * feePct).toFixed(2);
+    const netUsd = +(amountUsd - feeUsd).toFixed(2);
+    const assetAmount = +(netUsd / priceUsd).toFixed(8);
+    const ts = new Date().toISOString();
+
+    res.json({
+      ok: true,
+      asset: asset.toUpperCase(),
+      amountUsd,
+      priceUsd,
+      feePct,
+      feeUsd,
+      netUsd,
+      assetAmount,
+      timestamp: ts,
+    });
+  } catch (err: any) {
+    console.error('Quote error', err);
+    res.status(500).json({ ok: false, error: err?.message || 'Internal error' });
+  }
 });
 
-// Remote signing portal – fetch by token
-app.get("/api/sign/:token", (req, res) => {
-  const rec = findByToken(req.params.token);
-  if (!rec) return res.status(404).json({ error: "not found" });
-  return res.json({ id: rec.id, fullName: rec.fullName, asset: rec.asset, pricing: rec.pricing, statementPreview: true });
-});
-
-// Submit client signature
-app.post("/api/sign/:token", upload.none(), async (req, res) => {
+// Guarda firma (opcionalmente recibes la imagen dataURL para anexarla al PDF/registro)
+// body: { fullName, consent, dataUrl }
+app.post('/api/save-signature', async (req: Request, res: Response) => {
   try {
-    const rec = findByToken(req.params.token);
-    if (!rec) return res.status(404).json({ error: "not found" });
-    const sigDataUrl = req.body.signatureDataUrl as string;
-    if (!sigDataUrl?.startsWith("data:image/png;base64,")) return res.status(400).json({ error: "invalid signature" });
-    const base64 = sigDataUrl.split(",")[1];
-    const buf = Buffer.from(base64, "base64");
-    const stored = await saveEncryptedFile("signature", buf, "png");
-    const files = { ...rec.files, signature: stored } as any;
-    const next = updateTx(rec.id, { files, status: "signed" });
-    return res.json({ ok: true, id: next?.id });
-  } catch (e: any) { return res.status(500).json({ error: e.message }); }
+    const { fullName, consent, dataUrl } = req.body || {};
+    if (!fullName || typeof consent !== 'boolean') {
+      return res.status(400).json({ ok: false, error: 'fullName and consent required' });
+    }
+    // Aquí podrías guardar en DB o GDrive la firma (dataUrl)
+    res.json({ ok: true });
+  } catch (err: any) {
+    console.error('Signature error', err);
+    res.status(500).json({ ok: false, error: err?.message || 'Internal error' });
+  }
 });
 
-// Send receipts
-app.post("/api/tx/:id/send", async (req, res) => {
+// Finaliza & envía recibo (email opcional con SendGrid)
+// body: { email?, phone? }
+app.post('/api/finalize', async (req: Request, res: Response) => {
   try {
-    const id = req.params.id; const rec = findById(id);
-    if (!rec) return res.status(404).json({ error: "not found" });
-    const toEmail = req.body.toEmail as string | undefined;
-    const toSMS = req.body.toSMS as string | undefined;
-    const toWA = req.body.toWA as string | undefined;
-    const pdfBase64 = req.body.pdfBase64 as string | undefined;
+    const { email, phone } = req.body || {};
+    if (!email && !phone) {
+      return res.status(400).json({ ok: false, error: 'email or phone required' });
+    }
 
-    const subject = `Your ${rec.asset} Receipt – ${new Date().toISOString().slice(0,10)}`;
-    const body = `Hello ${rec.fullName},\n\nReceipt attached. Pricing at ${rec.pricing.pricedAtISO}, amount ${rec.pricing.amountCrypto} ${rec.asset}.\n`;
+    // Si configuraste SendGrid, envía un correo de confirmación
+    if (email && process.env.SENDGRID_API_KEY && process.env.EMAIL_FROM) {
+      const html = `
+        <div style="font-family:Inter,Segoe UI,Arial,sans-serif">
+          <h2>AG Management – Receipt</h2>
+          <p>We received your submission. Our team will process your order (up to 24h).</p>
+          <p>If you need help, reply to this email.</p>
+        </div>
+      `;
+      await sgMail.send({
+        to: email,
+        from: process.env.EMAIL_FROM!,
+        subject: 'Your crypto purchase receipt',
+        html,
+      });
+    }
 
-    if (toEmail && pdfBase64) await sendEmail(toEmail, subject, body, pdfBase64, `receipt-${rec.id}.pdf`);
-  } catch (e: any) { return res.status(500).json({ error: e.message }); }
+    res.json({ ok: true });
+  } catch (err: any) {
+    console.error('Finalize error', err);
+    res.status(500).json({ ok: false, error: err?.message || 'Internal error' });
+  }
 });
 
-app.listen(process.env.PORT || 8080, () => console.log(`API on :${process.env.PORT || 8080}`));
+// -----------------------------
+// Errores
+// -----------------------------
+app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
+  console.error('Unhandled error', err);
+  res.status(500).json({ ok: false, error: 'Internal error' });
+});
+
+// -----------------------------
+// Start
+// -----------------------------
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, () => {
+  console.log(`KYC backend listening on :${PORT}`);
+  console.log('Allowed origins:', allowed);
+});
